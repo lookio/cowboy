@@ -39,6 +39,7 @@
 
 -record(state, {
 	socket :: inet:socket(),
+	raw_data :: iolist(),
 	transport :: module(),
 	middlewares :: [module()],
 	compress :: boolean(),
@@ -89,7 +90,7 @@ init(Ref, Socket, Transport, Opts) ->
 	OnResponse = get_value(onresponse, Opts, undefined),
 	Timeout = get_value(timeout, Opts, 5000),
 	ok = ranch:accept_ack(Ref),
-	wait_request(<<>>, #state{socket=Socket, transport=Transport,
+	wait_request(<<>>, #state{socket=Socket, raw_data=[], transport=Transport,
 		middlewares=Middlewares, compress=Compress, env=Env,
 		max_empty_lines=MaxEmptyLines, max_keepalive=MaxKeepalive,
 		max_request_line_length=MaxRequestLineLength,
@@ -127,11 +128,11 @@ recv(Socket, Transport, Until) ->
 	end.
 
 -spec wait_request(binary(), #state{}, non_neg_integer()) -> ok.
-wait_request(Buffer, State=#state{socket=Socket, transport=Transport,
+wait_request(Buffer, State=#state{socket=Socket, raw_data=Raw_Data, transport=Transport,
 		until=Until}, ReqEmpty) ->
 	case recv(Socket, Transport, Until) of
 		{ok, Data} ->
-			parse_request(<< Buffer/binary, Data/binary >>, State, ReqEmpty);
+      parse_request(<< Buffer/binary, Data/binary >>, State#state{raw_data=[Raw_Data,Data]}, ReqEmpty);
 		{error, _} ->
 			terminate(State)
 	end.
@@ -225,12 +226,12 @@ parse_version(_, State, _, _, _) ->
 wait_header(_, State=#state{max_headers=MaxHeaders}, _, _, _, _, Headers)
 		when length(Headers) >= MaxHeaders ->
 	error_terminate(400, State);
-wait_header(Buffer, State=#state{socket=Socket, transport=Transport,
+wait_header(Buffer, State=#state{socket=Socket, raw_data=Raw_Data, transport=Transport,
 		until=Until}, M, P, Q, V, H) ->
 	case recv(Socket, Transport, Until) of
 		{ok, Data} ->
 			parse_header(<< Buffer/binary, Data/binary >>,
-				State, M, P, Q, V, H);
+				State#state{raw_data=[Raw_Data,Data]}, M, P, Q, V, H);
 		{error, timeout} ->
 			error_terminate(408, State);
 		{error, _} ->
@@ -273,12 +274,12 @@ parse_hd_name_ws(<< C, Rest/bits >>, S, M, P, Q, V, H, Name) ->
 	end.
 
 wait_hd_before_value(Buffer, State=#state{
-		socket=Socket, transport=Transport, until=Until},
+		socket=Socket, raw_data=Raw_Data, transport=Transport, until=Until},
 		M, P, Q, V, H, N) ->
 	case recv(Socket, Transport, Until) of
 		{ok, Data} ->
 			parse_hd_before_value(<< Buffer/binary, Data/binary >>,
-				State, M, P, Q, V, H, N);
+				State#state{raw_data=[Raw_Data,Data]}, M, P, Q, V, H, N);
 		{error, timeout} ->
 			error_terminate(408, State);
 		{error, _} ->
@@ -305,11 +306,11 @@ parse_hd_before_value(Buffer, State=#state{
 %% to change the other arguments' position and trigger costy
 %% operations for no reasons.
 wait_hd_value(_, State=#state{
-		socket=Socket, transport=Transport, until=Until},
+		socket=Socket, raw_data=Raw_Data, transport=Transport, until=Until},
 		M, P, Q, V, H, N, SoFar) ->
 	case recv(Socket, Transport, Until) of
 		{ok, Data} ->
-			parse_hd_value(Data, State, M, P, Q, V, H, N, SoFar);
+			parse_hd_value(Data, State#state{raw_data=[Raw_Data,Data]}, M, P, Q, V, H, N, SoFar);
 		{error, timeout} ->
 			error_terminate(408, State);
 		{error, _} ->
@@ -320,13 +321,13 @@ wait_hd_value(_, State=#state{
 %% to check for multilines allows us to avoid a few tests in
 %% the critical path, but forces us to have a special function.
 wait_hd_value_nl(_, State=#state{
-		socket=Socket, transport=Transport, until=Until},
+		socket=Socket, raw_data=Raw_Data, transport=Transport, until=Until},
 		M, P, Q, V, Headers, Name, SoFar) ->
 	case recv(Socket, Transport, Until) of
-		{ok, << C, Data/bits >>} when C =:= $\s; C =:= $\t  ->
-			parse_hd_value(Data, State, M, P, Q, V, Headers, Name, SoFar);
+		{ok, << C, Data/bits >> = Data2} when C =:= $\s; C =:= $\t  ->
+			parse_hd_value(Data, State#state{raw_data=[Raw_Data,Data2]}, M, P, Q, V, Headers, Name, SoFar);
 		{ok, Data} ->
-			parse_header(Data, State, M, P, Q, V, [{Name, SoFar}|Headers]);
+			parse_header(Data, State#state{raw_data=[Raw_Data,Data]}, M, P, Q, V, [{Name, SoFar}|Headers]);
 		{error, timeout} ->
 			error_terminate(408, State);
 		{error, _} ->
@@ -394,14 +395,14 @@ parse_host(<< C, Rest/bits >>, E, Acc) ->
 %%
 %% We create the Req object and start handling the request.
 
-request(Buffer, State=#state{socket=Socket, transport=Transport,
+request(Buffer, State=#state{socket=Socket, raw_data=Raw_Data, transport=Transport,
 		req_keepalive=ReqKeepalive, max_keepalive=MaxKeepalive,
 		compress=Compress, onresponse=OnResponse},
 		Method, Path, Query, Version, Headers, Host, Port) ->
 	case Transport:peername(Socket) of
 		{ok, Peer} ->
 			Req = cowboy_req:new(Socket, Transport, Peer, Method, Path,
-				Query, Version, Headers, Host, Port, Buffer,
+				Query, Version, Headers, Host, Port, Buffer, Raw_Data,
 				ReqKeepalive < MaxKeepalive, Compress, OnResponse),
 			onrequest(Req, State);
 		{error, _} ->
@@ -486,11 +487,11 @@ next_request(Req, State=#state{req_keepalive=Keepalive, timeout=Timeout},
 	end.
 
 -spec error_terminate(cowboy:http_status(), #state{}) -> ok.
-error_terminate(Status, State=#state{socket=Socket, transport=Transport,
+error_terminate(Status, State=#state{socket=Socket, raw_data=Raw_Data, transport=Transport,
 		compress=Compress, onresponse=OnResponse}) ->
 	error_terminate(Status, cowboy_req:new(Socket, Transport,
 		undefined, <<"GET">>, <<>>, <<>>, 'HTTP/1.1', [], <<>>,
-		undefined, <<>>, false, Compress, OnResponse), State).
+		undefined, <<>>, Raw_Data, false, Compress, OnResponse), State).
 
 -spec error_terminate(cowboy:http_status(), cowboy_req:req(), #state{}) -> ok.
 error_terminate(Status, Req, State) ->

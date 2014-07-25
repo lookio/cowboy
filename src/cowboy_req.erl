@@ -16,7 +16,8 @@
 -module(cowboy_req).
 
 %% Request API.
--export([new/14]).
+-export([new/15]).
+-export([raw_data/1]).
 -export([method/1]).
 -export([version/1]).
 -export([peer/1]).
@@ -134,6 +135,7 @@
 	p_headers = [] :: [any()],
 	cookies = undefined :: undefined | [{binary(), binary()}],
 	meta = [] :: [{atom(), any()}],
+	raw_data = [] :: iolist(),
 
 	%% Request body.
 	body_state = waiting :: waiting | done | {stream, non_neg_integer(),
@@ -164,15 +166,15 @@
 	undefined | {inet:ip_address(), inet:port_number()},
 	binary(), binary(), binary(),
 	cowboy:http_version(), cowboy:http_headers(), binary(),
-	inet:port_number() | undefined, binary(), boolean(), boolean(),
+	inet:port_number() | undefined, binary(), iolist(), boolean(), boolean(),
 	undefined | cowboy:onresponse_fun())
 	-> req().
 new(Socket, Transport, Peer, Method, Path, Query,
-		Version, Headers, Host, Port, Buffer, CanKeepalive,
+		Version, Headers, Host, Port, Buffer, Raw_Data, CanKeepalive,
 		Compress, OnResponse) ->
 	Req = #http_req{socket=Socket, transport=Transport, pid=self(), peer=Peer,
 		method=Method, path=Path, qs=Query, version=Version,
-		headers=Headers, host=Host, port=Port, buffer=Buffer,
+		headers=Headers, host=Host, port=Port, raw_data=Raw_Data, buffer=Buffer,
 		resp_compress=Compress, onresponse=OnResponse},
 	case CanKeepalive of
 		false ->
@@ -191,6 +193,11 @@ new(Socket, Transport, Peer, Method, Path, Query,
 						p_headers=[{<<"connection">>, Tokens}]}
 			end
 	end.
+
+
+-spec raw_data(Req) -> {iolist(), Req} when Req::req().
+raw_data(Req) ->
+	{Req#http_req.raw_data, Req}.
 
 -spec method(Req) -> {binary(), Req} when Req::req().
 method(Req) ->
@@ -579,11 +586,11 @@ body_loop(Req=#http_req{buffer=Buffer, body_state={stream, Length, _, _, _}},
 			Res
 	end.
 
-body_recv(Req=#http_req{transport=Transport, socket=Socket, buffer=Buffer},
+body_recv(Req=#http_req{transport=Transport, socket=Socket, raw_data=Raw_Data, buffer=Buffer},
 		ReadTimeout, ReadLength) ->
 	case Transport:recv(Socket, ReadLength, ReadTimeout) of
 		{ok, Data} ->
-			body_decode(Req#http_req{buffer= << Buffer/binary, Data/binary >>},
+			body_decode(Req#http_req{buffer= << Buffer/binary, Data/binary >>, raw_data=[Raw_Data,Data]},
 				ReadTimeout);
 		Error = {error, _} ->
 			{error, Error, Req}
